@@ -430,6 +430,7 @@ class APIServerAdapter(BasePlatformAdapter):
         session_id: Optional[str] = None,
         stream_delta_callback=None,
         tool_progress_callback=None,
+        model_override: Optional[str] = None,
     ) -> Any:
         """
         Create an AIAgent instance using the gateway's runtime config.
@@ -438,13 +439,23 @@ class APIServerAdapter(BasePlatformAdapter):
         base_url, etc. from config.yaml / env vars.  Toolsets are resolved
         from config.yaml platform_toolsets.api_server (same as all other
         gateway platforms), falling back to the hermes-api-server default.
+
+        If the OpenAI-compatible client sends a non-empty ``model`` in the
+        request body, it takes precedence over the gateway default (fixes
+        empty model when gateway config is unset).
         """
         from run_agent import AIAgent
         from gateway.run import _resolve_runtime_agent_kwargs, _resolve_gateway_model, _load_gateway_config
         from hermes_cli.tools_config import _get_platform_tools
 
         runtime_kwargs = _resolve_runtime_agent_kwargs()
-        model = _resolve_gateway_model()
+        requested = (model_override or "").strip()
+        model = requested or _resolve_gateway_model() or (self._model_name or "").strip()
+        if not model:
+            raise ValueError(
+                "No LLM model: set non-empty `model` in the API request body, "
+                "or configure a default model in Hermes (config / gateway env)."
+            )
 
         user_config = _load_gateway_config()
         enabled_toolsets = sorted(_get_platform_tools(user_config, "api_server"))
@@ -569,7 +580,11 @@ class APIServerAdapter(BasePlatformAdapter):
             # history already set from request body above
 
         completion_id = f"chatcmpl-{uuid.uuid4().hex[:29]}"
-        model_name = body.get("model", self._model_name)
+        raw_model = body.get("model")
+        requested_model = str(raw_model).strip() if raw_model is not None else None
+        if requested_model == "":
+            requested_model = None
+        model_name = requested_model or self._model_name
         created = int(time.time())
 
         if stream:
@@ -609,6 +624,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 stream_delta_callback=_on_delta,
                 tool_progress_callback=_on_tool_progress,
                 agent_ref=agent_ref,
+                model_override=requested_model,
             ))
 
             return await self._write_sse_chat_completion(
@@ -623,6 +639,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 conversation_history=history,
                 ephemeral_system_prompt=system_prompt,
                 session_id=session_id,
+                model_override=requested_model,
             )
 
         idempotency_key = request.headers.get("Idempotency-Key")
@@ -888,12 +905,18 @@ class APIServerAdapter(BasePlatformAdapter):
         # Run the agent (with Idempotency-Key support)
         session_id = str(uuid.uuid4())
 
+        raw_model = body.get("model")
+        requested_model = str(raw_model).strip() if raw_model is not None else None
+        if requested_model == "":
+            requested_model = None
+
         async def _compute_response():
             return await self._run_agent(
                 user_message=user_message,
                 conversation_history=conversation_history,
                 ephemeral_system_prompt=instructions,
                 session_id=session_id,
+                model_override=requested_model,
             )
 
         idempotency_key = request.headers.get("Idempotency-Key")
@@ -946,7 +969,7 @@ class APIServerAdapter(BasePlatformAdapter):
             "object": "response",
             "status": "completed",
             "created_at": created_at,
-            "model": body.get("model", self._model_name),
+            "model": requested_model or self._model_name,
             "output": output_items,
             "usage": {
                 "input_tokens": usage.get("input_tokens", 0),
@@ -1315,6 +1338,7 @@ class APIServerAdapter(BasePlatformAdapter):
         stream_delta_callback=None,
         tool_progress_callback=None,
         agent_ref: Optional[list] = None,
+        model_override: Optional[str] = None,
     ) -> tuple:
         """
         Create an agent and run a conversation in a thread executor.
@@ -1335,6 +1359,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 session_id=session_id,
                 stream_delta_callback=stream_delta_callback,
                 tool_progress_callback=tool_progress_callback,
+                model_override=model_override,
             )
             if agent_ref is not None:
                 agent_ref[0] = agent
@@ -1495,6 +1520,11 @@ class APIServerAdapter(BasePlatformAdapter):
         session_id = body.get("session_id") or run_id
         ephemeral_system_prompt = instructions
 
+        raw_model = body.get("model")
+        requested_model = str(raw_model).strip() if raw_model is not None else None
+        if requested_model == "":
+            requested_model = None
+
         async def _run_and_close():
             try:
                 agent = self._create_agent(
@@ -1502,6 +1532,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     session_id=session_id,
                     stream_delta_callback=_text_cb,
                     tool_progress_callback=event_cb,
+                    model_override=requested_model,
                 )
                 def _run_sync():
                     r = agent.run_conversation(
