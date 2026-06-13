@@ -100,6 +100,28 @@ def _is_mcp_tool_parallel_safe(tool_name: str) -> bool:
         return False
 
 
+# Database tools: sample before count/query when batched in one turn.
+_DATABASE_TOOL_ORDER: dict[str, int] = {
+    "schema_sample": 10,
+    "count_rows": 20,
+    "database_query": 30,
+}
+
+
+def _sort_tool_calls_for_grounding(tool_calls) -> list:
+    """Run schema_sample before count/query when batched."""
+    if not tool_calls or len(tool_calls) <= 1:
+        return list(tool_calls)
+    names = {getattr(getattr(tc, "function", None), "name", None) for tc in tool_calls}
+    ordered = set(_DATABASE_TOOL_ORDER)
+    if not (names & ordered):
+        return list(tool_calls)
+    return sorted(
+        tool_calls,
+        key=lambda tc: _DATABASE_TOOL_ORDER.get(tc.function.name, 50),
+    )
+
+
 def _should_parallelize_tool_batch(tool_calls) -> bool:
     """Return True when a tool-call batch is safe to run concurrently."""
     if len(tool_calls) <= 1:
@@ -107,6 +129,10 @@ def _should_parallelize_tool_batch(tool_calls) -> bool:
 
     tool_names = [tc.function.name for tc in tool_calls]
     if any(name in _NEVER_PARALLEL_TOOLS for name in tool_names):
+        return False
+
+    names_set = set(tool_names)
+    if "count_rows" in names_set and "schema_sample" in names_set:
         return False
 
     reserved_paths: list[Path] = []

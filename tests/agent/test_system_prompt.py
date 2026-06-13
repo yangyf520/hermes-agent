@@ -96,3 +96,48 @@ class TestCodingContextBlock:
         monkeypatch.setenv("TERMINAL_CWD", str(tmp_path))
         agent = _make_agent(valid_tool_names=[], platform="cli")
         assert "coding agent" not in _stable_prompt(agent)
+
+
+class TestDatabaseQueryGuidance:
+    """The answer-discipline contract is tool-gated guidance: present iff the
+    database_query tool is loaded (mirrors MEMORY_GUIDANCE/COMPUTER_USE)."""
+
+    def test_injected_when_database_query_loaded(self):
+        stable = _stable_prompt(_make_agent(valid_tool_names=["database_query"]))
+        assert "schema_sample" in stable
+        assert "count_rows" in stable
+        assert "clarify" in stable
+
+    def test_absent_without_database_query(self):
+        stable = _stable_prompt(_make_agent(valid_tool_names=[]))
+        assert "schema_sample" not in stable or "count_rows" not in stable
+
+
+class TestSkillAutoload:
+    """A skill with `metadata.hermes.autoload: true` + `requires_toolsets` must
+    have its BODY injected once the toolset is active. The model skips
+    `skill_view` and just starts querying, so a workflow-governing skill
+    (ask-data) has to be present at decision time, not fetched on demand."""
+
+    def _write_skill(self, tmp_path, monkeypatch, autoload: bool):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        d = tmp_path / "skills" / "data-science" / "demo"
+        d.mkdir(parents=True, exist_ok=True)
+        flag = "    autoload: true\n" if autoload else ""
+        (d / "SKILL.md").write_text(
+            "---\nname: demo\ndescription: d\nmetadata:\n  hermes:\n"
+            "    requires_toolsets: [database]\n" + flag + "---\n\nDEMO-METHOD-BODY\n",
+            encoding="utf-8",
+        )
+
+    def test_body_injected_when_toolset_active(self, tmp_path, monkeypatch):
+        from agent.prompt_builder import get_autoload_skill_bodies
+        self._write_skill(tmp_path, monkeypatch, autoload=True)
+        assert any("DEMO-METHOD-BODY" in b for b in get_autoload_skill_bodies({"database"}))
+
+    def test_not_injected_without_toolset_or_flag(self, tmp_path, monkeypatch):
+        from agent.prompt_builder import get_autoload_skill_bodies
+        self._write_skill(tmp_path, monkeypatch, autoload=True)
+        assert get_autoload_skill_bodies(set()) == []           # toolset not active
+        self._write_skill(tmp_path, monkeypatch, autoload=False)  # flag removed
+        assert get_autoload_skill_bodies({"database"}) == []

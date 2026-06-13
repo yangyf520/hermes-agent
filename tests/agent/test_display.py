@@ -131,6 +131,50 @@ class TestBuildToolPreview:
         assert result == "2 tasks: AAAAAAAAAAAAAAAAAA..."
         assert len(result) == 30
 
+    def test_wiki_search_preview(self):
+        result = build_tool_preview("wiki_search", {"question": "今年网络类的问题一共有多少？"})
+        assert result is not None
+        assert "今年" in result
+
+    def test_schema_sample_preview(self):
+        result = build_tool_preview("schema_sample", {"table": "Fact_IT_StStatus"})
+        assert result is not None
+        assert "Fact_IT_StStatus" in result
+
+    def test_count_rows_preview(self):
+        result = build_tool_preview("count_rows", {"tables": [{"table": "sr"}, {"table": "st"}]})
+        assert result is not None
+
+    def test_count_rows_activity_line_with_sql(self):
+        line = get_cute_tool_message(
+            "count_rows",
+            {"tables": [{"table": "sr", "filters": [{"column": "lb_first_class", "op": "=", "value": "1"}]}]},
+            0.1,
+            result=json.dumps({
+                "success": True,
+                "number": 42,
+                "final_sql": "SELECT COUNT(*) AS cnt FROM sr WHERE lb_first_class = '1'",
+                "tables": [{"table": "sr", "count": 42}],
+            }),
+        )
+        assert "N=42" in line
+        assert "SELECT COUNT(*)" in line
+
+    def test_count_rows_zero_count_activity(self):
+        line = get_cute_tool_message(
+            "count_rows",
+            {"tables": [{"table": "sr"}]},
+            0.1,
+            result=json.dumps({
+                "success": True,
+                "number": 0,
+                "final_sql": "SELECT COUNT(*) AS cnt FROM sr",
+                "tables": [{"table": "sr", "count": 0}],
+                "zero_count_diagnostic": {"sr": {"filter_column_samples": {}}},
+            }),
+        )
+        assert "N=0" in line or "zero_count_diagnostic" in line
+
     def test_false_like_args_zero(self):
         """Non-dict falsy values should return None, not crash."""
         assert build_tool_preview("terminal", 0) is None

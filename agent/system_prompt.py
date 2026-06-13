@@ -210,6 +210,31 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     if agent.valid_tool_names:
         stable_parts.append(STEER_CHANNEL_NOTE)
 
+    # Database: short answer-discipline contract when database_query is loaded
+    # (same tool-gated pattern as MEMORY_GUIDANCE). Wiki semantics stay at the
+    # edges: read_file/search_files + llm-wiki / ask-data skills.
+    if "database_query" in agent.valid_tool_names:
+        from agent.prompt_builder import get_database_query_guidance
+        stable_parts.append(get_database_query_guidance())
+
+    # Skill autoload: inject the full body of any skill that declares
+    # `metadata.hermes.autoload: true` and whose required toolsets are all
+    # active. The model skips `skill_view` and just starts querying, so a skill
+    # that MUST govern its toolset's workflow (e.g. ask-data) is injected as
+    # high-authority, prefix-cached system text instead. Frontmatter-driven, no
+    # skill name in code.
+    try:
+        from agent.prompt_builder import get_autoload_skill_bodies as _autoload_bodies
+        _autoload_toolsets = {
+            ts
+            for ts in (_r.get_toolset_for_tool(t) for t in agent.valid_tool_names)
+            if ts
+        }
+        for _skill_body in _autoload_bodies(_autoload_toolsets):
+            stable_parts.append(_skill_body)
+    except Exception:
+        pass  # Non-critical — a missing/unreadable skill degrades silently.
+
     # Computer-use — goes in as its own block rather than being merged into
     # tool_guidance because the content is multi-paragraph. The guidance is
     # rendered for the host platform so Windows/Linux hosts don't see

@@ -199,6 +199,7 @@ from agent.trajectory import (
 )
 from agent.tool_dispatch_helpers import (
     _should_parallelize_tool_batch,
+    _sort_tool_calls_for_grounding,
     _is_destructive_command,  # noqa: F401  # re-exported for tests that access `run_agent._is_destructive_command`
     _extract_parallel_scope_path,  # noqa: F401  # re-exported for tests that `from run_agent import _extract_parallel_scope_path`
     _paths_overlap,  # noqa: F401  # re-exported for tests that `from run_agent import _paths_overlap`
@@ -5193,6 +5194,10 @@ class AIAgent:
         file reads/writes may do so only when their target paths do not overlap.
         """
         tool_calls = assistant_message.tool_calls
+        sorted_calls = _sort_tool_calls_for_grounding(tool_calls)
+        if sorted_calls is not tool_calls:
+            assistant_message.tool_calls = sorted_calls
+            tool_calls = sorted_calls
 
         # Allow _vprint during tool execution even with stream consumers
         self._executing_tools = True

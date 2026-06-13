@@ -190,6 +190,14 @@ def _delegate_task_goal_parts(tasks: Any, *, per_goal_len: int) -> tuple[int, li
     return len(goals), goals
 
 
+def _compact_sql(sql: str, max_len: int = 96) -> str:
+    """Collapse SQL to one line for activity feed display."""
+    one = " ".join(str(sql).split())
+    if len(one) <= max_len:
+        return one
+    return one[: max_len - 3] + "..."
+
+
 def build_tool_preview(tool_name: str, args: dict, max_len: int | None = None) -> str | None:
     """Build a short preview of a tool call's primary argument for display.
 
@@ -211,6 +219,9 @@ def build_tool_preview(tool_name: str, args: dict, max_len: int | None = None) -
         "cronjob": "action",
         "execute_code": "code", "delegate_task": "goal",
         "clarify": "question", "skill_manage": "name",
+        "database_query": "sql",
+        "schema_sample": "table",
+        "count_rows": "tables",
     }
 
     # delegate_task: show goal (single) or individual task goals (batch)
@@ -1050,6 +1061,25 @@ def get_cute_tool_message(
         if action == "list":
             return _wrap(f"┊ ⏰ cron      listing  {dur}")
         return _wrap(f"┊ ⏰ cron      {action} {args.get('job_id', '')}  {dur}")
+    if tool_name == "schema_sample":
+        table = args.get("table", "")
+        cols = args.get("columns")
+        suffix = f"[{', '.join(str(c) for c in cols[:3])}{'…' if len(cols) > 3 else ''}]" if cols else "all"
+        return _wrap(f"┊ 🔍 sample    {table} {suffix}  {dur}")
+    if tool_name == "count_rows":
+        specs = args.get("tables") or []
+        tbls = ", ".join(str(s.get("table", "?")) for s in specs[:3] if isinstance(s, dict))
+        data = safe_json_loads(result) if result else {}
+        if isinstance(data, dict) and data.get("success"):
+            n = data.get("number")
+            sql = _compact_sql(str(data.get("final_sql") or ""), 80)
+            detail = f"{tbls} → N={n}" + (f" | {sql}" if sql else "")
+        elif isinstance(data, dict) and data.get("zero_count_diagnostic"):
+            detail = f"{tbls} → N=0 (check zero_count_diagnostic)"
+        else:
+            detail = tbls or "…"
+        sql_limit = 0 if _tool_preview_max_len == 0 else max(_tool_preview_max_len, 140)
+        return _wrap(f"┊ 🔢 count     {_trunc(detail, sql_limit)}  {dur}")
     if tool_name == "execute_code":
         code = args.get("code", "")
         first_line = code.strip().split("\n")[0] if code.strip() else ""

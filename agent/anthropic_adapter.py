@@ -14,6 +14,7 @@ import copy
 import json
 import logging
 import os
+import warnings
 import platform
 import secrets
 import stat
@@ -24,6 +25,15 @@ from urllib.parse import urlparse
 from hermes_constants import get_hermes_home
 from typing import Any, Dict, List, Optional, Tuple
 from utils import base_url_host_matches, normalize_proxy_env_vars
+
+# Third-party Anthropic proxies fall back to thinking.type=enabled for
+# compatibility; the SDK warns on every request. Suppress — not actionable
+# in the CLI activity feed.
+warnings.filterwarnings(
+    "ignore",
+    message=r".*thinking\.type=enabled.*deprecated.*",
+    category=UserWarning,
+)
 
 # NOTE: `import anthropic` is deliberately NOT at module top — the SDK pulls
 # ~220 ms of imports (anthropic.types, anthropic.lib.tools._beta_runner, etc.)
@@ -2513,7 +2523,11 @@ def build_anthropic_kwargs(
         if reasoning_config.get("enabled") is not False and "haiku" not in model.lower():
             effort = str(reasoning_config.get("effort", "medium")).lower()
             budget = THINKING_BUDGET.get(effort, 8000)
-            if _supports_adaptive_thinking(model):
+            # Adaptive thinking + output_config is Anthropic-native (4.6+).
+            # Third-party Anthropic-compat proxies often ship older SDKs that
+            # reject output_config on Messages.stream() — fall back to manual
+            # thinking so users don't need per-proxy config tweaks.
+            if _supports_adaptive_thinking(model) and not _is_third_party_anthropic_endpoint(base_url):
                 kwargs["thinking"] = {
                     "type": "adaptive",
                     "display": "summarized",

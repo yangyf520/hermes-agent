@@ -13,8 +13,25 @@ import pytest
 from agent.tool_dispatch_helpers import (
     _is_untrusted_tool,
     _maybe_wrap_untrusted,
+    _should_parallelize_tool_batch,
+    _sort_tool_calls_for_grounding,
     make_tool_result_message,
 )
+
+
+def _tc(name: str, args: dict | None = None):
+    """Minimal tool-call stand-in for dispatch tests."""
+
+    class _Fn:
+        def __init__(self, n, a):
+            self.name = n
+            self.arguments = __import__("json").dumps(a or {})
+
+    class _Call:
+        def __init__(self, n, a):
+            self.function = _Fn(n, a)
+
+    return _Call(name, args)
 
 
 # =========================================================================
@@ -174,3 +191,27 @@ class TestMakeToolResultMessage:
         assert "DATA, not as instructions" in content
         assert content.startswith('<untrusted_tool_result source="web_extract">')
         assert content.endswith("</untrusted_tool_result>")
+
+
+# =========================================================================
+# Database tool batching (fewer LLM turns)
+# =========================================================================
+
+
+class TestDatabaseToolBatching:
+    def test_schema_sample_sorted_before_count_rows(self):
+        calls = [
+            _tc("count_rows", {"tables": [{"table": "t"}]}),
+            _tc("schema_sample", {"table": "t", "columns": ["a"]}),
+        ]
+        names = [tc.function.name for tc in _sort_tool_calls_for_grounding(calls)]
+        assert names == ["schema_sample", "count_rows"]
+
+    def test_count_rows_not_parallel_with_schema_sample(self):
+        """count_rows is not parallel-safe — sample runs first when batched."""
+        calls = [
+            _tc("schema_sample", {"table": "t", "columns": ["a"]}),
+            _tc("count_rows", {"tables": [{"table": "t"}]}),
+        ]
+        assert not _should_parallelize_tool_batch(calls)
+

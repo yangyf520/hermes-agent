@@ -1265,6 +1265,20 @@ class TestBuildAnthropicKwargs:
         assert "temperature" not in kwargs
         assert kwargs["max_tokens"] == 4096
 
+    def test_third_party_proxy_uses_manual_thinking_without_output_config(self):
+        kwargs = build_anthropic_kwargs(
+            model="claude-opus-4-6",
+            messages=[{"role": "user", "content": "think hard"}],
+            tools=None,
+            max_tokens=4096,
+            reasoning_config={"enabled": True, "effort": "high"},
+            base_url="http://api.llmio.dev",
+        )
+        assert "output_config" not in kwargs
+        assert kwargs["thinking"]["type"] == "enabled"
+        assert kwargs["thinking"]["budget_tokens"] == 16000
+        assert kwargs["temperature"] == 1
+
     def test_reasoning_config_downgrades_xhigh_to_max_for_4_6_models(self):
         # Opus 4.7 added "xhigh" as a distinct effort level (low/medium/high/
         # xhigh/max). Opus 4.6 only supports low/medium/high/max — sending

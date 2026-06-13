@@ -322,34 +322,6 @@ TASK_COMPLETION_GUIDANCE = (
     "is always better than inventing a result."
 )
 
-# Universal parallel-tool-call guidance — applied to ALL models.
-#
-# Why this matters for cost: every assistant turn resends the entire
-# accumulated conversation (and, on cache-friendly providers, re-reads the
-# cached prefix and pays for the newly-appended turn). A model that issues
-# one tool call per turn multiplies the number of round-trips — and therefore
-# the resent context — for any task that needs several independent reads,
-# searches, or safe lookups. Batching independent calls into a single
-# assistant response collapses N turns into one, cutting both latency and the
-# resent-context cost that compounds over a long conversation.
-#
-# The hermes-agent runtime already executes a batch of tool calls
-# concurrently when they are independent (read-only tools always; path-scoped
-# file ops when their targets don't overlap — see
-# run_agent._execute_tool_calls / tool_dispatch_helpers). The missing piece
-# was telling the *model* to emit those calls together in the first place.
-# Until now the only batching steer in the prompt lived in
-# GOOGLE_MODEL_OPERATIONAL_GUIDANCE — Gemini/Gemma got it, every other model
-# got nothing. This block makes the steer universal; the now-redundant
-# Google-only bullet has been dropped so no model receives it twice.
-#
-# Short on purpose — shipped in the cached system prompt to every user, every
-# session. Token cost is paid once at install and amortised across all
-# sessions via prefix caching. Keep it tight.
-#
-# Ported from cline/cline#11514 ("encourage parallel tool calls"), adapted
-# from Cline's TypeScript tool-surface guidance to hermes-agent's Python
-# prompt-assembly architecture.
 PARALLEL_TOOL_CALL_GUIDANCE = (
     "# Parallel tool calls\n"
     "When you need several pieces of information that don't depend on each "
@@ -362,6 +334,58 @@ PARALLEL_TOOL_CALL_GUIDANCE = (
     "call's result (e.g. you must read a file before you can patch it). When "
     "in doubt and the calls are independent, batch them."
 )
+
+# Always-on discipline for answering data questions, injected when the
+# database_query tool is loaded (same tool-gated pattern as MEMORY_GUIDANCE).
+# ask-data SKILL.md points here; do not duplicate rules in the skill body.
+DATABASE_QUERY_GUIDANCE = (
+    "# Data questions\n"
+    "Gather evidence before filtering: data dictionary (read_file, search_files), "
+    "`schema_sample` on intent-relevant columns, then `count_rows` or `database_query`. "
+    "Prefer `count_rows` for simple counts; use `database_query` for GROUP BY / JOIN / trends.\n"
+    "For each new database counting question in a session, first read dictionary `index.md`, "
+    "then read at least one linked entity page before choosing table/columns. "
+    "Do not skip this by jumping from a guessed column name directly to `schema_sample`/`count_rows`.\n"
+    "Map the question to index/entity descriptions — do not pick a table from a filter column "
+    "you noticed on another table. If multiple tables could apply → `clarify` before counting.\n"
+    "When multiple candidate fact tables could answer the question, run table arbitration first: "
+    "choose the table whose entity description, metrics grain, and business scope best match user intent. "
+    "If intent words are generic and more than one table remains plausible, ask `clarify` instead of defaulting to one.\n"
+    "When using coded filters (class/category/status/type/code), rely on explicit codebook evidence: "
+    "column + code + label + source page. If evidence is missing or mismatched, run follow-up "
+    "`read_file`/`clarify` before concluding.\n"
+    "Minimize SQL/tool calls: after scope and mapping are confirmed, issue one final count query for the "
+    "requested metric. Do not run exploratory multiple counts unless the user explicitly asks for a "
+    "breakdown or comparison.\n"
+    "Clarify discipline: if a clarify request times out or is unanswered, stop and ask the user again in "
+    "natural language; do not continue with guessed assumptions or additional SQL.\n"
+    "In the final answer, state coded-filter evidence explicitly (field, code, label, source page or "
+    "source line). If `count_rows` returns `requires_clarify` or evidence_warning, ask a clarification "
+    "question instead of asserting semantics.\n"
+    "Resolve relative time phrases from the current date. Report one number for the asked "
+    "scope only; do not append wider totals unless the user asked.\n"
+    "Do not invent columns, values, tables, or scope."
+)
+
+
+def get_database_query_guidance() -> str:
+    """DATABASE_QUERY_GUIDANCE plus configured dictionary path when one exists."""
+    root = None
+    try:
+        from tools import database_tool as _db
+
+        root = _db.data_dictionary_root()
+    except Exception:
+        pass
+    if not root:
+        return DATABASE_QUERY_GUIDANCE
+    index = os.path.join(root, "index.md")
+    return (
+        f"{DATABASE_QUERY_GUIDANCE}\n"
+        f"Configured data dictionary: `{index}` — `read_file` it first on new count "
+        "questions, then `search_files` / entity pages under that directory for column "
+        "and code mappings."
+    )
 
 # OpenAI GPT/Codex-specific execution guidance.  Addresses known failure modes
 # where GPT models abandon work on partial results, skip prerequisite lookups,
@@ -999,6 +1023,13 @@ def build_environment_hints() -> str:
 
     hints: list[str] = []
 
+    # Current date — the model is otherwise never told "today", so any
+    # relative window (今年/this year, last month, last 7 days) is a blind
+    # guess. Date only (not time) so the cached system prompt stays stable
+    # within a day and only rotates the prefix cache at the date boundary.
+    from datetime import datetime
+    hints.append(f"Current date: {datetime.now().strftime('%Y-%m-%d (%A)')}")
+
     backend = (os.getenv("TERMINAL_ENV") or "local").strip().lower()
     is_remote_backend = backend in _REMOTE_TERMINAL_BACKENDS
 
@@ -1615,6 +1646,59 @@ def build_skills_system_prompt(
             _SKILLS_PROMPT_CACHE.popitem(last=False)
 
     return result
+
+
+def get_autoload_skill_bodies(active_toolsets: "set[str] | None" = None) -> list[str]:
+    """Full bodies of skills that declare ``metadata.hermes.autoload: true`` and
+    whose ``requires_toolsets`` are all present in ``active_toolsets``.
+
+    A skill that MUST govern its toolset's workflow is injected as high-authority
+    system text the moment the toolset is active — rather than relying on the
+    model to choose ``skill_view`` (which it skips, then just starts querying).
+    Frontmatter-driven: any skill opts in, no skill name is hardcoded. Local
+    skills win over external dirs on name collision; disabled/incompatible skills
+    are skipped. Never raises.
+    """
+    active = active_toolsets or set()
+    disabled = get_disabled_skill_names()
+    bodies: list[str] = []
+    seen: set[str] = set()
+    dirs = [get_skills_dir(), *get_all_skills_dirs()[1:]]
+    for d in dirs:
+        try:
+            if not d or not Path(d).exists():
+                continue
+        except Exception:
+            continue
+        for skill_file in iter_skill_index_files(d, "SKILL.md"):
+            try:
+                is_compatible, frontmatter, _desc = _parse_skill_file(skill_file)
+                if not is_compatible:
+                    continue
+                name = str(frontmatter.get("name") or skill_file.parent.name)
+                if name in seen or name in disabled:
+                    continue
+                cond = extract_skill_conditions(frontmatter)
+                if not cond.get("autoload"):
+                    continue
+                if any(ts not in active for ts in (cond.get("requires_toolsets") or [])):
+                    continue
+                raw = skill_file.read_text(encoding="utf-8")
+                _fm, _body = parse_frontmatter(raw)
+                # Token discipline: allow a compact autoload prompt in frontmatter.
+                # If present, inject only that compact contract instead of the full body.
+                compact = (
+                    (((_fm.get("metadata") or {}).get("hermes") or {}).get("autoload_prompt"))
+                    if isinstance(_fm, dict)
+                    else None
+                )
+                body = str(compact).strip() if isinstance(compact, str) and compact.strip() else _strip_yaml_frontmatter(raw).strip()
+                if body:
+                    seen.add(name)
+                    bodies.append(body)
+            except Exception as e:
+                logger.debug("autoload skill scan skipped %s: %s", skill_file, e)
+    return bodies
 
 
 def build_nous_subscription_prompt(valid_tool_names: "set[str] | None" = None) -> str:

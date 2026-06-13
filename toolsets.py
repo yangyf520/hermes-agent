@@ -100,6 +100,15 @@ TOOLSETS = {
         "includes": []
     },
 
+    "database": {
+        "description": (
+            "Natural-language SQL: schema_sample, count_rows, "
+            "and read-only database_query. Requires DB_DSN or DATABASE_URL."
+        ),
+        "tools": ["schema_sample", "count_rows", "database_query"],
+        "includes": [],
+    },
+
     "x_search": {
         "description": (
             "Search X (Twitter) posts and threads via xAI's built-in "
