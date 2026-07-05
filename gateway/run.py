@@ -26,6 +26,7 @@ except ModuleNotFoundError:
 
 import asyncio
 import dataclasses
+import functools
 import inspect
 import json
 import logging
@@ -2163,6 +2164,83 @@ def _load_gateway_config() -> dict:
     except Exception:
         pass
     return raw if isinstance(raw, dict) else {}
+
+
+_ASK_KNOWLEDGE_PREFETCH_UNSET = object()
+_ASK_KNOWLEDGE_PREFETCH = _ASK_KNOWLEDGE_PREFETCH_UNSET
+
+
+def _kb_prefetch_direct_reply(kb_found, kb_direct_reply: str | None) -> bool:
+    """Whether gateway should skip the agent for a prefetch hook result."""
+    if not kb_direct_reply:
+        return False
+    if kb_found is True:
+        return True
+    text = str(kb_direct_reply)
+    if text.startswith("Feishu authorization saved"):
+        return True
+    if text.startswith("Authorization failed"):
+        return True
+    if "Knowledge base access requires your authorization" in text:
+        return True
+    return text.startswith("Feishu")
+
+
+def _find_ask_knowledge_script() -> Path | None:
+    """Locate the ask-knowledge skill script by skill metadata."""
+    try:
+        from agent.skill_utils import get_all_skills_dirs, iter_skill_index_files, parse_frontmatter
+        from hermes_constants import get_bundled_skills_dir
+
+        repo_skills = Path(__file__).resolve().parents[1] / "skills"
+        seen: set[Path] = set()
+        for raw in [*get_all_skills_dirs(), get_bundled_skills_dir(default=repo_skills)]:
+            try:
+                skills_dir = Path(raw).resolve()
+            except Exception:
+                continue
+            if skills_dir in seen or not skills_dir.is_dir():
+                continue
+            seen.add(skills_dir)
+            for skill_md in iter_skill_index_files(skills_dir, "SKILL.md"):
+                try:
+                    fm, _ = parse_frontmatter(skill_md.read_text(encoding="utf-8"))
+                except OSError:
+                    continue
+                if str(fm.get("name", "")).strip() != "ask-knowledge":
+                    continue
+                candidate = skill_md.parent / "scripts" / "ask_knowledge.py"
+                if candidate.is_file():
+                    return candidate
+    except Exception:
+        logger.debug("Could not discover ask-knowledge skill script", exc_info=True)
+    return None
+
+
+def _load_ask_knowledge_maybe_prefetch():
+    """Load ask-knowledge skill hook (all KB logic lives in that script)."""
+    global _ASK_KNOWLEDGE_PREFETCH
+    if _ASK_KNOWLEDGE_PREFETCH is not _ASK_KNOWLEDGE_PREFETCH_UNSET and _ASK_KNOWLEDGE_PREFETCH is not False:
+        return _ASK_KNOWLEDGE_PREFETCH or None
+    try:
+        import importlib.util
+
+        path = _find_ask_knowledge_script()
+        if path is None:
+            _ASK_KNOWLEDGE_PREFETCH = False
+            return None
+        spec = importlib.util.spec_from_file_location("hermes_ask_knowledge", path)
+        if spec is None or spec.loader is None:
+            _ASK_KNOWLEDGE_PREFETCH = False
+            return None
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        fn = getattr(mod, "maybe_prefetch_knowledge_message", None) if mod else None
+        _ASK_KNOWLEDGE_PREFETCH = fn if callable(fn) else False
+    except Exception:
+        logger.debug("Could not load ask-knowledge prefetch hook", exc_info=True)
+        _ASK_KNOWLEDGE_PREFETCH = False
+    return _ASK_KNOWLEDGE_PREFETCH or None
 
 
 def _load_gateway_runtime_config() -> dict:
@@ -9598,6 +9676,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if message_text is None:
             return
 
+        original_user_message = message_text
+        kb_persist_user: Optional[str] = None
+        kb_found: Optional[bool] = None
+        kb_direct_reply: Optional[str] = None
+
         # Capture the platform event time as message metadata and keep the
         # persisted transcript clean (strip any leading timestamp prefix).
         # This runs regardless of the toggle so storage stays clean and the
@@ -9634,6 +9717,45 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         except Exception as _ts_err:
             logger.debug("Message timestamp injection failed (non-fatal): %s", _ts_err)
 
+        if source.platform == Platform.FEISHU:
+            try:
+                maybe_prefetch_knowledge_message = _load_ask_knowledge_maybe_prefetch()
+                if maybe_prefetch_knowledge_message is not None:
+                    _raw = getattr(event, "raw_message", None)
+                    feishu_open_id = (
+                        str(source.user_id or "")
+                        if str(source.user_id or "").startswith("ou_")
+                        else ""
+                    )
+                    if not feishu_open_id and _raw is not None:
+                        try:
+                            _ev = getattr(_raw, "event", None) or _raw
+                            if isinstance(_ev, dict):
+                                _sid = ((_ev.get("sender") or {}).get("sender_id") or {})
+                                _oid = str(_sid.get("open_id") or "").strip()
+                            else:
+                                _s = getattr(_ev, "sender", None)
+                                _sid = getattr(_s, "sender_id", None) if _s else None
+                                _oid = str(getattr(_sid, "open_id", None) or "").strip()
+                            if _oid.startswith("ou_"):
+                                feishu_open_id = _oid
+                        except Exception:
+                            pass
+                    _kb_query_text = persist_user_message or original_user_message
+                    message_text, kb_persist_user, kb_found, kb_direct_reply = (
+                        await self._run_in_executor_with_context(
+                            maybe_prefetch_knowledge_message,
+                            _kb_query_text,
+                            str(source.user_id or ""),
+                            _load_gateway_config(),
+                            feishu_open_id=feishu_open_id,
+                            feishu_raw_event=getattr(event, "raw_message", None),
+                        )
+                    )
+            except Exception as exc:
+                logger.warning("Knowledge prefetch hook skipped: %s", exc)
+
+
         # Bind this gateway run generation to the adapter's active-session
         # event so deferred post-delivery callbacks can be released by the
         # same run that registered them.
@@ -9656,6 +9778,42 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             }
             await self.hooks.emit("agent:start", hook_ctx)
 
+            # KB edge reply: confirmed hits and OAuth/auth prompts only; other misses fall through.
+            if _kb_prefetch_direct_reply(kb_found, kb_direct_reply):
+                response = kb_direct_reply
+                if response.startswith("Feishu"):
+                    logger.warning("Knowledge prefetch Feishu error: %s", response[:500])
+                ts = datetime.now().isoformat()
+                _user_content = (
+                    kb_persist_user
+                    or persist_user_message
+                    or original_user_message
+                )
+                _user_entry = {
+                    "role": "user",
+                    "content": _user_content,
+                    "timestamp": (
+                        persist_user_timestamp
+                        if persist_user_timestamp is not None
+                        else ts
+                    ),
+                }
+                if event.message_id:
+                    _user_entry["message_id"] = str(event.message_id)
+                self.session_store.append_to_transcript(session_entry.session_id, _user_entry)
+                self.session_store.append_to_transcript(
+                    session_entry.session_id,
+                    {"role": "assistant", "content": response, "timestamp": ts},
+                )
+                logger.info(
+                    "Knowledge prefetch direct_reply: kb_found=%s platform=%s user=%s",
+                    kb_found,
+                    _platform_name,
+                    source.user_id or "unknown",
+                )
+                await self.hooks.emit("agent:end", {**hook_ctx, "response": response[:500]})
+                return response
+
             # Run the agent
             agent_result = await self._run_agent(
                 message=message_text,
@@ -9667,7 +9825,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 run_generation=run_generation,
                 event_message_id=self._reply_anchor_for_event(event),
                 channel_prompt=event.channel_prompt,
-                persist_user_message=persist_user_message,
+                persist_user_message=kb_persist_user or persist_user_message,
                 persist_user_timestamp=persist_user_timestamp,
             )
 
@@ -10023,7 +10181,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 _user_entry = {
                     "role": "user",
                     "content": (
-                        persist_user_message
+                        kb_persist_user
+                        or persist_user_message
                         if persist_user_message is not None
                         else message_text
                     ),
@@ -10049,7 +10208,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     _user_entry = {
                         "role": "user",
                         "content": (
-                            persist_user_message
+                            kb_persist_user
+                            or persist_user_message
                             if persist_user_message is not None
                             else message_text
                         ),
@@ -10175,7 +10335,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # agent already reached its early turn-start persistence, the latest
             # transcript user row will match and we skip the duplicate.
             try:
-                if 'message_text' in locals() and message_text is not None and session_entry is not None:
+                if (
+                    "original_user_message" in locals()
+                    and original_user_message is not None
+                    and session_entry is not None
+                ):
                     _already_persisted = False
                     try:
                         _recent_transcript = self.session_store.load_transcript(session_entry.session_id)
@@ -10184,7 +10348,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     for _msg in reversed(_recent_transcript[-10:]):
                         if _msg.get("role") == "user":
                             _expected_user_content = (
-                                persist_user_message
+                                kb_persist_user
+                                or persist_user_message
                                 if persist_user_message is not None
                                 else message_text
                             )
@@ -10194,7 +10359,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         _user_entry = {
                             "role": "user",
                             "content": (
-                                persist_user_message
+                                kb_persist_user
+                                or persist_user_message
                                 if persist_user_message is not None
                                 else message_text
                             ),
@@ -12849,11 +13015,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         from gateway.session_context import clear_session_vars
         clear_session_vars(tokens)
 
-    async def _run_in_executor_with_context(self, func, *args):
+    async def _run_in_executor_with_context(self, func, *args, **kwargs):
         """Run blocking work in the thread pool while preserving session contextvars."""
         loop = asyncio.get_running_loop()
         ctx = copy_context()
-        return await loop.run_in_executor(None, ctx.run, func, *args)
+        if args or kwargs:
+            func = functools.partial(func, *args, **kwargs)
+        return await loop.run_in_executor(None, ctx.run, func)
 
     def _decide_image_input_mode(self) -> str:
         """Resolve the image-input routing for the currently active model.

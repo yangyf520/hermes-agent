@@ -13,19 +13,19 @@ metadata:
 
 # Ask-Data Skill
 
-Core rules: **`DATABASE_QUERY_GUIDANCE`**. This bundled copy is a template only.
+Core rules: **DATABASE_QUERY_GUIDANCE**. Table and column detail lives in `~/wiki`.
 
-## Setup (your org, `~/.hermes/skills/data-science/ask-data/`)
+## Config
 
-1. Copy here; set `metadata.hermes.autoload: true` if you want org hints every data session
-2. Put **your** disambiguation shortcuts in `metadata.hermes.autoload_prompt` (compact)
-3. Table/column/codebook detail stays in the wiki (`llm-wiki`) — not in core, not duplicated here
+- DB credentials in `~/.hermes/.env` (`DB_DSN` or `DB_TYPE` + host/user/password)
+- 问数 entry: `platform_toolsets.feishu` includes `database` (prefetch auto-off)
+- FAQ entry: `hermes-feishu` only, `knowledge.prefetch: true` (separate group/profile)
 
 ## Workflow
 
 1. `read_file` → dictionary `index.md`
-2. `search_files` / `read_file` → entity pages the index points to
-3. `schema_sample` → columns named on the chosen entity page
+2. `read_file` → entity pages linked from the index
+3. `schema_sample` → columns on the chosen entity page
 4. `count_rows` or `database_query`
 
-If index + entities do not resolve which table → `clarify`.
+If the index and entity pages still do not resolve the table → `clarify`.

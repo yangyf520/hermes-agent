@@ -530,4 +530,4 @@ WebSocket 和按群 ACL 设置通过 `config.yaml` 的 `platforms.feishu.extra` 
 
 ## 工具集
 
-飞书 / Lark 使用 `hermes-feishu` 平台预设，包含与 Telegram 及其他基于 gateway 的消息平台相同的核心工具。
+飞书 / Lark 主会话用 `hermes-feishu`（问答，不含 database）。问数另开配置档案或群，配 `all` 或 `database`。

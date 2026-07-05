@@ -339,6 +339,20 @@ async def test_run_in_executor_with_context_forwards_args():
 
 
 @pytest.mark.asyncio
+async def test_run_in_executor_with_context_forwards_kwargs():
+    """_run_in_executor_with_context should forward **kwargs to the callable."""
+    runner = object.__new__(GatewayRunner)
+
+    def greet(name, *, title=""):
+        return f"{title}{name}" if title else name
+
+    result = await runner._run_in_executor_with_context(
+        greet, "alice", title="Dr. "
+    )
+    assert result == "Dr. alice"
+
+
+@pytest.mark.asyncio
 async def test_run_in_executor_with_context_propagates_exceptions():
     """Exceptions inside the executor should propagate to the caller."""
     runner = object.__new__(GatewayRunner)
